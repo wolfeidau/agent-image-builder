@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: This template creates an EC2 Image Builder pipeline that builds an Ubuntu image.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: buildkite-agent
+    Description: The name of the application.
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+
+  Stage:
+    Type: String
+    Default: dev
+    Description: The stage of the application.
+    AllowedPattern: '^[a-z]+$'
+  
+  Architecture:
+    Type: String
+    Default: arm64
+    Description: The architecture of the image.
+    AllowedPattern: '^[a-zA-Z0-9]+$'
+
+  ImageName:
+    Type: String
+    Default: ubuntu-server-22-lts-arm64/2025.5.8
+    Description: The name of the image to use for the build.
+  
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 1 * * ? *)"
+    Description: The cron expression to use for the schedule.
+
+Resources:
+  # Topic for the pipeline to notify
+  PipelineTopic:
+    Type: AWS::SNS::Topic
+    Properties: {}
+
+  # Create an S3 Bucket for logs.
+  # When deleting the stack, make sure to empty the bucket first.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-s3-bucket.html
+  ImageBuilderLogBucket:
+    Type: AWS::S3::Bucket
+    # If you want to delete the stack, but keep the bucket, set the DeletionPolicy to Retain.
+    # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-deletionpolicy.html
+    # DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # By default, AWS Services do not have permission to perform actions on your instances. This grants
+  # AWS Systems Manager (SSM) and EC2 Image Builder the necessary permissions to build an image.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-role.html
+  # https://docs.aws.amazon.com/imagebuilder/latest/userguide/image-builder-setting-up.html
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Comment: Role to be used by instance during image build.
+    Properties:
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - !Sub 'ec2.${AWS::URLSuffix}'
+        Version: '2012-10-17'
+      Path: /executionServiceEC2Role/
+
+  # Policy to allow the instance to write to the S3 bucket (via instance role / instance profile).
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-policy.html
+  InstanceRoleLoggingPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      Comment: Allows the instance to save log files to an S3 bucket.
+    Properties:
+      PolicyName: ImageBuilderLogBucketPolicy
+      Roles:
+        - Ref: InstanceRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - Fn::Sub:
+                  - arn:${AWS::Partition}:s3:::${BUCKET}/*
+                  - BUCKET:
+                      Ref: ImageBuilderLogBucket
+
+  # To pass the InstanceRole to an EC2 instance, we need an InstanceProfile.
+  # This profile will be used during the image build process.
+  # https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-ec2_instance-profiles.html
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /executionServiceEC2Role/
+      Roles:
+        - Ref: InstanceRole
+
+  # Specifies the infrastructure within which to build and test your image.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-imagebuilder-infrastructureconfiguration.html
+  UbuntuImageInfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Sub ${AppName}-ubuntu-image-builder-${Architecture}-${Stage}
+      InstanceProfileName: !Ref InstanceProfile
+      # Specify an S3 bucket and EC2 Image Builder will save logs to the bucket.
+      Logging:
+        S3Logs:
+          S3BucketName:
+            Ref: ImageBuilderLogBucket
+          # S3KeyPrefix: 'my-imagebuilder-bucket-prefix'
+      SnsTopicArn: !Ref PipelineTopic
+      # If you would like to keep the instance running after a failed build, set TerminateInstanceOnFailure to false.
+      # TerminateInstanceOnFailure: false
+      # If you do not have a default VPC or want to use a different VPC, you must specify the subnet ID to use
+      # SubnetId: 'subnet-id'
+
+  # The CloudWatch LogGroup for the image build logs is provided to ensure the LogGroup is cleaned up if the stack is deleted.
+  UbuntuLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/imagebuilder/${AppName}-${Architecture}-${Stage}
+      RetentionInDays: 3
+
+  # Recipe which references the latest (x.x.x) version of the Amazon Linux 2 AMI).
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-imagebuilder-imagerecipe.html
+  UbuntuImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Sub ${AppName}-ubuntu-image-builder-${Architecture}-${Stage}
+      Version: 0.0.1
+      # ${AWS::Partition} returns the partition where you are running the CloudFormation template. For standard AWS regions, the
+      # partition is aws. For resources elsewhere, the partition is aws-partitionname. For example, China (Beijing and Ningxia)
+      # regions use aws-cn and AWS GovCloud (US) regions are aws-us-gov.
+      # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/pseudo-parameter-reference.html
+      ParentImage:
+        Fn::Sub: arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:image/${ImageName}
+      Components:
+        - ComponentArn: !Sub "arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/update-linux/1.0.2/1"
+        - ComponentArn: !Sub "arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/docker-ce-ubuntu/1.0.0/1"
+        - ComponentArn: !Sub "arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/amazon-cloudwatch-agent-linux/1.0.1/1"
+        - ComponentArn: !Sub "arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/reboot-linux/1.0.1/1"
+
+      AdditionalInstanceConfiguration:
+        UserDataOverride:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              sudo systemctl stop snap.amazon-ssm-agent.amazon-ssm-agent.service
+              sudo snap refresh amazon-ssm-agent --channel=candidate
+              sudo systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
+
+  # The Image resource will show complete in CloudFormation once your image is done building. Use this resource later in your
+  # stack to reference the image within other resources.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-imagebuilder-image.html
+  UbuntuBuildkiteAgent:
+    Type: AWS::ImageBuilder::Image
+    Properties:
+      ImageRecipeArn:
+        Ref: UbuntuImageRecipe
+      InfrastructureConfigurationArn:
+        Ref: UbuntuImageInfrastructureConfiguration
+
+  # Create an SSM Parameter Store entry with our resulting ImageId.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ssm-parameter.html
+  UbuntuBuildkiteAgentParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: Image Id for Ubuntu 22.04 with the latest version of the Buildkite agent installed
+      Name: !Sub /${Stage}/images/${AppName}-ubuntu-${Architecture}
+      Type: String
+      Value:
+        Fn::GetAtt: [UbuntuBuildkiteAgent, ImageId]
+
+  EC2ImageBuilderDistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Sub ${AppName}-ubuntu-image-builder-${Architecture}-${Stage}
+      Distributions:
+        - Region: !Ref AWS::Region
+          AmiDistributionConfiguration: {}
+
+  EC2ImageBuilderPipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Sub ${AppName}-ubuntu-image-builder-${Architecture}-${Stage}
+      ImageRecipeArn: !Ref UbuntuImageRecipe
+      InfrastructureConfigurationArn: !Ref UbuntuImageInfrastructureConfiguration
+      DistributionConfigurationArn: !Ref EC2ImageBuilderDistributionConfiguration
+      Schedule:
+        PipelineExecutionStartCondition: EXPRESSION_MATCH_ONLY
+        ScheduleExpression: !Ref ScheduleExpression
+
+  BuildkiteAgentInstallComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: buildkite-agent-ubuntu
+      Platform: Linux
+      SupportedOsVersions:
+        - Ubuntu
+      Version: '0.1.0'
+      Description: Installs the latest version of the Buildkite agent.
+      Data: |
+        name: Buildkite Agent
+        description: Installs the latest version of the Buildkite agent.
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallHttpsPrerequisites
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo apt-get update
+                    - sudo apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+              - name: InstallDockerGPGKey
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - curl -fsSL https://keys.openpgp.org/vks/v1/by-fingerprint/32A37959C2FA5C3C99EFBC32A79206696452D198 | sudo gpg --dearmor -o /usr/share/keyrings/buildkite-agent-archive-keyring.gpg
+              - name: InstallDockerRepository
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - echo "deb [signed-by=/usr/share/keyrings/buildkite-agent-archive-keyring.gpg] https://apt.buildkite.com/buildkite-agent stable main" | sudo tee /etc/apt/sources.list.d/buildkite-agent.list
+              - name: InstallDockerCE
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo apt-get update
+                    - sudo apt-get install -y buildkite-agent

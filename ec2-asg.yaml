@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EC2: auto scaling pool of GPU instances for training'
+
+Parameters:
+  Stage:
+    Description: 'The name of the stage, e.g. dev, prod, staging.'
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z]+$'
+  ParentVPCStack:
+    Description: 'Stack name of parent VPC stack based on vpc/vpc-*azs.yaml template.'
+    Type: String
+  ParentAlertStack:
+    Description: 'Optional but recommended stack name of parent alert stack based on operations/alert.yaml template.'
+    Type: String
+    Default: ''
+  SubnetsReach:
+    Description: 'Should the cluster have direct access to the Internet or do you prefer private subnets with NAT?'
+    Type: String
+    Default: Public
+    AllowedValues:
+    - Public
+    - Private
+  MaxSize:
+    Description: 'The maximum size of the Auto Scaling group.'
+    Type: Number
+    Default: 1
+    ConstraintDescription: 'Must be >= 1'
+    MinValue: 1
+  MinSize:
+    Description: 'The minimum size of the Auto Scaling group.'
+    Type: Number
+    Default: 0
+  DesiredCapacity:
+    Description: 'The desired capacity of the Auto Scaling group.'
+    Type: Number
+    Default: 0
+  BuildkiteAgentToken:
+    Description: Buildkite agent registration token.
+    Type: String
+    NoEcho: true
+  AMI:
+    Description: 'The AMI ID to use for the instances.'
+    Type: AWS::EC2::Image::Id
+
+Outputs:
+  BuildkiteAgentTokenParameter:
+    Value: !Ref BuildkiteAgentTokenParameter
+  AssetBucketArn:
+    Value: !GetAtt AssetBucket.Arn
+
+Conditions:
+  HasAlertTopic: !Not [!Equals [!Ref ParentAlertStack, '']]
+
+Resources:
+  AssetBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AssetBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: AssetBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:*
+            Resource:
+              - Fn::Sub: arn:aws:s3:::${AssetBucket}/*
+              - Fn::Sub: arn:aws:s3:::${AssetBucket}
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity:
+        Ref: DesiredCapacity
+      HealthCheckType: EC2
+      MaxSize:
+        Ref: MaxSize
+      MinSize:
+        Ref: MinSize
+      LaunchTemplate:
+        LaunchTemplateId:
+          Ref: LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MetricsCollection:
+      - Granularity: '1Minute'
+        Metrics:
+        - 'GroupDesiredCapacity'
+      NotificationConfigurations: !If
+      - HasAlertTopic
+      - - NotificationTypes:
+          - 'autoscaling:EC2_INSTANCE_LAUNCH_ERROR'
+          - 'autoscaling:EC2_INSTANCE_TERMINATE_ERROR'
+          TopicARN: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      - []
+      VPCZoneIdentifier: !Split [',', {'Fn::ImportValue': !Sub '${ParentVPCStack}-Subnets${SubnetsReach}'}]
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+        PropagateAtLaunch: true
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: t4g.small
+        IamInstanceProfile:
+          Arn:
+            Fn::GetAtt:
+            - InstanceProfile
+            - Arn
+        ImageId: !Ref AMI
+        TagSpecifications:
+        - ResourceType: instance
+          Tags:
+          - Key: Name
+            Value:
+              Ref: AWS::StackName
+
+  InstanceProfile:
+    Properties:
+      Path: /
+      Roles:
+      - Ref: InstanceRole
+    Type: AWS::IAM::InstanceProfile
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Path: /
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogStreams
+            Effect: Allow
+            Resource: arn:aws:logs:*:*:*
+          Version: 2012-10-17
+        PolicyName:
+          Fn::Join:
+          - '-'
+          - - Ref: AWS::StackName
+            - cloudWatchLogsPolicy
+      - PolicyDocument:
+          Statement:
+          - Action: ec2:DescribeTags
+            Effect: Allow
+            Resource: '*'
+          Version: '2012-10-17'
+        PolicyName:
+          Fn::Join:
+          - '-'
+          - - Ref: AWS::StackName
+            - ec2DescribeTagsPolicy
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - autoscaling:SetInstanceProtection
+            - autoscaling:SetInstanceHealth
+            Effect: Allow
+            Resource: arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/*
+          Version: '2012-10-17'
+        PolicyName:
+          Fn::Join:
+          - '-'
+          - - Ref: AWS::StackName
+            - autoScalingGroupPolicy
+      - PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: 
+                - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Stage}/*"
+        PolicyName:
+          Fn::Join:
+          - '-'
+          - - Ref: AWS::StackName
+            - readAgentToken
+      - PolicyDocument:
+          Statement:
+          - Action:
+              - s3:GetObject
+              - s3:List*
+              - s3:GetBucketLocation
+              - s3:GetObjectVersion
+              - s3:GetLifecycleConfiguration
+            Effect: Allow
+            Resource:
+              - !Sub "${AssetBucket.Arn}/"
+              - !Sub "${AssetBucket.Arn}/*"
+        PolicyName:
+          Fn::Join:
+          - '-'
+          - - Ref: AWS::StackName
+            - readAssetsBucket
+  BuildkiteAgentTokenParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Stage}/buildkite/agent-token"
+      Type: String
+      Value: !Ref BuildkiteAgentToken
