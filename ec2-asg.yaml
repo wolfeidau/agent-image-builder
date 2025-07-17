@@ -1,7 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'EC2: auto scaling pool of GPU instances for training'
+Description: 'EC2: auto scaling pool of buildkite agent instances'
 
 Parameters:
+  AppName:
+    Description: 'The name of the application, e.g. my-app.'
+    Type: String
   Stage:
     Description: 'The name of the stage, e.g. dev, prod, staging.'
     Type: String
@@ -24,9 +27,9 @@ Parameters:
   MaxSize:
     Description: 'The maximum size of the Auto Scaling group.'
     Type: Number
-    Default: 1
+    Default: 10
     ConstraintDescription: 'Must be >= 1'
-    MinValue: 1
+    MinValue: 10
   MinSize:
     Description: 'The minimum size of the Auto Scaling group.'
     Type: Number
@@ -42,10 +45,16 @@ Parameters:
   AMI:
     Description: 'The AMI ID to use for the instances.'
     Type: AWS::EC2::Image::Id
+  InstanceType:
+    Description: 'The instance type to use for the instances.'
+    Type: String
+    Default: t4g.small
 
 Outputs:
   BuildkiteAgentTokenParameter:
     Value: !Ref BuildkiteAgentTokenParameter
+  AutoScalingGroup:
+    Value: !Ref AutoScalingGroup
   AssetBucketArn:
     Value: !GetAtt AssetBucket.Arn
 
@@ -120,7 +129,7 @@ Resources:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateData:
-        InstanceType: t4g.small
+        InstanceType: !Ref InstanceType
         IamInstanceProfile:
           Arn:
             Fn::GetAtt:
@@ -200,7 +209,9 @@ Resources:
           Version: '2012-10-17'
           Statement:
             - Effect: Allow
-              Action: ssm:GetParameter
+              Action: 
+                - ssm:GetParameter
+                - ssm:GetParametersByPath
               Resource: 
                 - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Stage}/*"
         PolicyName:
@@ -228,6 +239,6 @@ Resources:
   BuildkiteAgentTokenParameter:
     Type: AWS::SSM::Parameter
     Properties:
-      Name: !Sub "/${Stage}/buildkite/agent-token"
+      Name: !Sub "/${Stage}/${AppName}/buildkite/agent-token"
       Type: String
       Value: !Ref BuildkiteAgentToken

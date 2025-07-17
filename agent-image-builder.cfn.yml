@@ -29,6 +29,11 @@ Parameters:
     Type: String
     Default: "cron(0 1 * * ? *)"
     Description: The cron expression to use for the schedule.
+  
+  UbuntuImageRecipeVersion:
+    Type: String
+    Default: 0.0.1
+    Description: The version of the Ubuntu image recipe to use for the build.
 
 Resources:
   # Topic for the pipeline to notify
@@ -146,7 +151,7 @@ Resources:
     Type: AWS::ImageBuilder::ImageRecipe
     Properties:
       Name: !Sub ${AppName}-ubuntu-image-builder-${Architecture}-${Stage}
-      Version: 0.0.1
+      Version: !Ref UbuntuImageRecipeVersion
       # ${AWS::Partition} returns the partition where you are running the CloudFormation template. For standard AWS regions, the
       # partition is aws. For resources elsewhere, the partition is aws-partitionname. For example, China (Beijing and Ningxia)
       # regions use aws-cn and AWS GovCloud (US) regions are aws-us-gov.
@@ -158,6 +163,8 @@ Resources:
         - ComponentArn: !Sub "arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/docker-ce-ubuntu/1.0.0/1"
         - ComponentArn: !Sub "arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/amazon-cloudwatch-agent-linux/1.0.1/1"
         - ComponentArn: !Sub "arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/reboot-linux/1.0.1/1"
+        - ComponentArn: !Ref Ec2SSMConfigInstallComponent
+        - ComponentArn: !Ref BuildkiteAgentInstallComponent
 
       AdditionalInstanceConfiguration:
         UserDataOverride:
@@ -167,6 +174,56 @@ Resources:
               sudo systemctl stop snap.amazon-ssm-agent.amazon-ssm-agent.service
               sudo snap refresh amazon-ssm-agent --channel=candidate
               sudo systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
+
+  UbuntuImageBuilderLifecyclePolicy:
+    Type: AWS::ImageBuilder::LifecyclePolicy
+    Properties:
+      Name: !Sub ${AppName}-ubuntu-image-lifecycle-policy-${Architecture}-${Stage}
+      Description: Deletes pipeline images after the specified time period
+      ExecutionRole: !Ref ImageBuilderLifecycleExecutionRole
+      ResourceType: AMI_IMAGE
+      Status: ENABLED
+      PolicyDetails:
+        - Action:
+            Type: DELETE
+            IncludeResources:
+              Amis: true
+              Snapshots: true
+          Filter:
+            Type: COUNT
+            Value: 7
+      ResourceSelection:
+        Recipes:
+          - Name: !GetAtt UbuntuImageRecipe.Name
+            SemanticVersion: !Ref UbuntuImageRecipeVersion
+
+  ImageBuilderLifecycleExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: imagebuilder.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/EC2ImageBuilderLifecycleExecutionPolicy
+
+  SsmParamReadWritePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: "root"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: 
+              - "ssm:GetParameter"
+              - "ssm:PutParameter"
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${UbuntuBuildkiteAgentParameter}"
+      Roles: 
+        - Ref: ImageBuilderLifecycleExecutionRole
 
   # The Image resource will show complete in CloudFormation once your image is done building. Use this resource later in your
   # stack to reference the image within other resources.
@@ -197,6 +254,10 @@ Resources:
       Distributions:
         - Region: !Ref AWS::Region
           AmiDistributionConfiguration: {}
+          SsmParameterConfigurations:
+            - ParameterName: !Ref UbuntuBuildkiteAgentParameter
+              DataType: text
+              AmiAccountId: !Ref AWS::AccountId
 
   EC2ImageBuilderPipeline:
     Type: AWS::ImageBuilder::ImagePipeline
@@ -209,6 +270,51 @@ Resources:
         PipelineExecutionStartCondition: EXPRESSION_MATCH_ONLY
         ScheduleExpression: !Ref ScheduleExpression
 
+  Ec2SSMConfigInstallComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: ec2-ssm-service
+      Platform: Linux
+      SupportedOsVersions:
+        - Ubuntu
+      Version: '0.3.0'
+      Description: Installs the latest version of the Buildkite agent.
+      Data: !Sub |
+        name: EC2 Config SSM Service
+        description: Installs the latest version of the EC2 Config SSM Service.
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallHttpsPrerequisites
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo apt-get update
+                    - sudo apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+              - name: InstallBuildkiteAgentGPGKey
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo curl -L https://github.com/wolfeidau/ec2-ssm-service/releases/latest/download/ec2-ssm-service-linux-arm64.deb -o /tmp/ec2-ssm-service-linux-arm64.deb
+                    - sudo dpkg -i /tmp/ec2-ssm-service-linux-arm64.deb
+              - name: UpdateConfiguration
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      sudo cat > /etc/ec2-ssm-config-service.yaml << EOF
+                      configs:
+                          /${Stage}/${AppName}/agent-cfg: /etc/buildkite-agent/buildkite-agent.cfg
+                      env-files:
+                          /${Stage}/${AppName}/env: /var/lib/buildkite-agent/env
+                      EOF
+              - name: EnableService
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo systemctl enable ec2-ssm-config
+
   BuildkiteAgentInstallComponent:
     Type: AWS::ImageBuilder::Component
     Properties:
@@ -216,7 +322,7 @@ Resources:
       Platform: Linux
       SupportedOsVersions:
         - Ubuntu
-      Version: '0.1.0'
+      Version: '0.4.0'
       Description: Installs the latest version of the Buildkite agent.
       Data: |
         name: Buildkite Agent
@@ -231,19 +337,59 @@ Resources:
                   commands:
                     - sudo apt-get update
                     - sudo apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
-              - name: InstallDockerGPGKey
+              - name: InstallBuildkiteAgentGPGKey
                 action: ExecuteBash
                 inputs:
                   commands:
                     - curl -fsSL https://keys.openpgp.org/vks/v1/by-fingerprint/32A37959C2FA5C3C99EFBC32A79206696452D198 | sudo gpg --dearmor -o /usr/share/keyrings/buildkite-agent-archive-keyring.gpg
-              - name: InstallDockerRepository
+              - name: InstallBuildkiteAgentRepository
                 action: ExecuteBash
                 inputs:
                   commands:
                     - echo "deb [signed-by=/usr/share/keyrings/buildkite-agent-archive-keyring.gpg] https://apt.buildkite.com/buildkite-agent stable main" | sudo tee /etc/apt/sources.list.d/buildkite-agent.list
-              - name: InstallDockerCE
+              - name: InstallBuildkiteAgent
                 action: ExecuteBash
                 inputs:
                   commands:
                     - sudo apt-get update
                     - sudo apt-get install -y buildkite-agent
+              - name: UpdateSystemdService
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      sudo cat > /lib/systemd/system/buildkite-agent.service << EOF
+                      [Unit]
+                      Description=Buildkite Agent
+                      Documentation=https://buildkite.com/agent
+                      After=syslog.target
+                      After=network.target
+                      After=docker.service
+
+                      [Service]
+                      Type=simple
+                      User=buildkite-agent
+                      Environment=HOME=/var/lib/buildkite-agent
+                      # =~ means systemd won't error if the file doesn't exist
+                      EnvironmentFile=-/var/lib/buildkite-agent/env
+                      ExecStart=/usr/bin/buildkite-agent start
+                      RestartSec=5
+                      Restart=on-failure
+                      RestartForceExitStatus=SIGPIPE
+                      TimeoutStartSec=10
+                      TimeoutStopSec=0
+                      KillMode=process
+                      # https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#OOMScoreAdjust=
+                      # Set to -1000 to disable OOM killing of processes of buildkite-agent service
+                      # managing EC2 instance lifecycle
+                      OOMScoreAdjust=-1000
+
+                      [Install]
+                      WantedBy=multi-user.target
+                      EOF
+              - name: EnableBuildkiteAgentSystemdService
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo systemctl enable buildkite-agent
+                    - sudo usermod -a -G docker buildkite-agent
